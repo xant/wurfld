@@ -30,6 +30,7 @@ typedef struct {
     fbuf_t *input;
     fbuf_t *output;
     iomux_callbacks_t *callbacks;
+    int is_http10;
 } wurfld_connection_context;
 
 char *unescape_uri_request(char *uri) {
@@ -116,30 +117,36 @@ static void wurfld_output_handler(iomux_t *iomux, int fd, void *priv) {
         if (wb)
             fbuf_remove(ctx->output, wb);
 
-        if (wb == len)
+        if (wb == len) {
             ctx->callbacks->mux_output = NULL;
+            iomux_close(iomux, fd);
+        }
     }
 }
 
 static void wurfld_input_handler(iomux_t *iomux, int fd, void *data, int len, void *priv) {
     wurfld_connection_context *ctx = (wurfld_connection_context *)priv;
-    if (ctx) {
-        fbuf_add_binary(ctx->input, data, len);
-        DEBUG1("New data on fd %d", fd);
-        char *end = fbuf_end(ctx->input);
-        if ((use_http && fbuf_used(ctx->input) > 4 && (strncmp(end-4, "\r\n\r\n", 4) == 0 || strncmp(end-2, "\n\n", 2) == 0)) ||
-            (!use_http && fbuf_used(ctx->input) && *(end-1) == '\n'))
-        {
-            int is_http10 = 0;
+    if (!ctx)
+        return;
+    DEBUG1("New data on fd %d", fd);
+    fbuf_add_binary(ctx->input, data, len);
+    while (fbuf_used(ctx->input)) {
+        char *request_data = fbuf_data(ctx->input);
+        char *request_terminator = use_http ? strstr(request_data, "\r\n\r\n") : strstr(request_data, "\n");
+        if (!request_terminator && use_http) {
+            request_terminator = strstr(request_data, "\n\n");
+        }
+        if (request_terminator) {
             char *useragent = NULL;
             // we have a complete http request
             fbuf_trim(ctx->input);
-            if (use_http && strncmp(fbuf_data(ctx->input), "GET /lookup/", 12) == 0) {
+            if (use_http && strncmp(request_data, "GET /lookup/", 12) == 0) {
                 char *reqline_start = fbuf_data(ctx->input) + 12;
                 char *reqline_end = reqline_start;
 
                 while (*reqline_end != '\r' && *reqline_end != '\n')
                     reqline_end++;
+                reqline_end++;
 
                 char reqline[reqline_end-reqline_start];
                 snprintf(reqline, reqline_end-reqline_start, "%s", reqline_start);
@@ -148,14 +155,14 @@ static void wurfld_input_handler(iomux_t *iomux, int fd, void *data, int len, vo
                 if (httpv) {
                     *httpv = 0;
                     httpv++;
-                    is_http10 = (strncmp(httpv, "HTTP/1.0", 8) == 0);
+                    ctx->is_http10 = (strncmp(httpv, "HTTP/1.0", 8) == 0);
                 }
                 useragent = unescape_uri_request(reqline);
             } else if (!use_http) {
                 useragent = fbuf_data(ctx->input);
             }
 
-            if (useragent) {
+            if (useragent && strlen(useragent)) {
                 DEBUG1("Looking up useragent : %s", useragent);
                 wurfld_get_capabilities(useragent, ctx->output);
 
@@ -163,8 +170,8 @@ static void wurfld_input_handler(iomux_t *iomux, int fd, void *data, int len, vo
 
                 if (use_http) {
                     char response_header[1024];
-                    sprintf(response_header, "%s 200 OK\r\nContent-Type: application/json\r\nContent-length: %d\r\n\r\n",
-                            is_http10 ? "HTTP/1.0" : "HTTP/1.1", fbuf_used(ctx->output));
+                    sprintf(response_header, "%s 200 OK\r\nContent-Type: application/json\r\nContent-length: %d\r\nServer: wurfld\r\n%s\r\n",
+                            ctx->is_http10 ? "HTTP/1.0" : "HTTP/1.1", len, ctx->is_http10 ? "Connection: Close\r\n" : "");
                     iomux_write(iomux, fd, response_header, strlen(response_header));
                 }
 
@@ -173,14 +180,25 @@ static void wurfld_input_handler(iomux_t *iomux, int fd, void *data, int len, vo
                     fbuf_remove(ctx->output, wb);
                 // check if we still need to write stuff (because we might have filled in the output buffer
                 // and in case register an output handler to take care of that
-                if (wb != len) 
+                if (wb != len) {
                     ctx->callbacks->mux_output = wurfld_output_handler;
+                    if (ctx->is_http10)
+                        break;
+                } else if (ctx->is_http10) {
+                    iomux_close(iomux, fd);
+                    break;
+                }
             } else if (use_http) {
                 char response[2048];
-                snprintf(response, sizeof(response), "%s 400 NOT SUPPORTED\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\nNOT SUPPORTED", is_http10 ? "HTTP/1.0" : "HTTP/1.1");
+                snprintf(response, sizeof(response),
+                         "%s 400 NOT SUPPORTED\r\nContent-Type: text/plain\r\nContent-Length: 17\r\n\r\n400 NOT SUPPORTED",
+                         ctx->is_http10 ? "HTTP/1.0" : "HTTP/1.1");
                 iomux_write(iomux, fd, response, strlen(response));
             }
-            fbuf_clear(ctx->input);
+            fbuf_remove(ctx->input, request_terminator - request_data);
+            fbuf_trim(ctx->input);
+        } else {
+            break;
         }
     }
 }
@@ -260,6 +278,10 @@ static void wurfld_stop(int sig) {
     iomux_end_loop(iomux);
 }
 
+static void wurfld_do_nothing(int sig) {
+    DEBUG1("Signal %d received ... doing nothing\n", sig);
+}
+
 int main(int argc, char **argv) {
 
     int option_index = 0;
@@ -322,6 +344,7 @@ int main(int argc, char **argv) {
     signal(SIGHUP, wurfld_reload);
     signal(SIGINT, wurfld_stop);
     signal(SIGQUIT, wurfld_stop);
+    signal(SIGPIPE, wurfld_do_nothing);
 
     // initialize the callbacks descriptor
     wurfld_callbacks.mux_input = wurfld_input_handler;
