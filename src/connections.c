@@ -128,7 +128,7 @@ open_socket(const char *host, int port)
 	return -1;
     }
 
-    listen(sock, 5);
+    listen(sock, -1);
     fcntl(sock, F_SETFD, FD_CLOEXEC);
 
     return sock;

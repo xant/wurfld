@@ -8,6 +8,7 @@
 #include <iomux.h>
 #include <connections.h>
 #include <log.h>
+#include <sys/socket.h>
 #include <pthread.h>
 
 #include <wurfl/wurfl.h>
@@ -18,21 +19,20 @@
 #define WURFL_DBFILE_DEFAULT "/usr/share/wurfl/wurfl.xml"
 #define WURFL_PORT_DEFAULT 4321
 #define WURFL_ADDRESS_DEFAULT "*"
-#define WURFL_LOGLEVEL_DEFAULT 2
+#define WURFL_LOGLEVEL_DEFAULT 0
 #define WURFL_USERAGENT_SIZE_THRESHOLD 16
 
 static wurfl_handle wurfl = NULL;
 static iomux_t *iomux = NULL;
 static char *wurfl_file = WURFL_DBFILE_DEFAULT;
 static int use_http = 1;
-static iomux_callbacks_t wurfld_callbacks;
 
 pthread_mutex_t wurfld_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
     fbuf_t *input;
     fbuf_t *output;
-    iomux_callbacks_t *callbacks;
+    iomux_callbacks_t callbacks;
     int is_http10;
     char *useragent;
     int fd;
@@ -101,17 +101,19 @@ static void wurfld_get_capabilities(char *useragent, fbuf_t *output) {
 }
 
 static void wurfld_connection_handler(iomux_t *iomux, int fd, void *priv) {
-    DEBUG1("New connection using fd %d", fd); 
-    iomux_callbacks_t *connection_callbacks = malloc(sizeof(iomux_callbacks_t));
-    memcpy(connection_callbacks, &wurfld_callbacks, sizeof(iomux_callbacks_t));
+    iomux_callbacks_t *wurfld_callbacks = (iomux_callbacks_t *)priv;
 
+    // create and initialize the context for the new connection
     wurfld_connection_context *context = calloc(1, sizeof(wurfld_connection_context));
+
+    memcpy(&context->callbacks, wurfld_callbacks, sizeof(iomux_callbacks_t));
+
     context->input = fbuf_create(0);
     context->output = fbuf_create(0);
-    context->callbacks = connection_callbacks;
-    connection_callbacks->priv = context;
+    context->callbacks.priv = context;
 
-    iomux_add(iomux, fd, connection_callbacks);
+    // and wait for input data
+    iomux_add(iomux, fd, &context->callbacks);
 }
 
 static void send_response(wurfld_connection_context *ctx) {
@@ -124,8 +126,12 @@ static void send_response(wurfld_connection_context *ctx) {
 
     if (use_http) {
         char response_header[1024];
-        sprintf(response_header, "%s 200 OK\r\nContent-Type: application/json\r\nContent-length: %d\r\nServer: wurfld\r\n%s\r\n",
-                ctx->is_http10 ? "HTTP/1.0" : "HTTP/1.1", fbuf_used(ctx->output), ctx->is_http10 ? "Connection: Close\r\n" : "");
+        sprintf(response_header, "%s 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-length: %d\r\n"
+                "Server: wurfld\r\n"
+                "Connection: Close\r\n\r\n",
+                ctx->is_http10 ? "HTTP/1.0" : "HTTP/1.1", fbuf_used(ctx->output));
         int wb = 0;
         int ofx = 0;
         int hlen = strlen(response_header);
@@ -133,8 +139,19 @@ static void send_response(wurfld_connection_context *ctx) {
             hlen -= wb;
             ofx += wb;
             wb = write(ctx->fd, response_header + wb, hlen);
+            if (wb == -1) {
+                if (errno != EINTR || errno != EAGAIN) {
+                    NOTICE("write on fd %d failed: %s", ctx->fd, strerror(errno));
+                    shutdown(ctx->fd, SHUT_RDWR);
+                    close(ctx->fd);
+                    return;
+                }
+            } else if (wb == 0) {
+                shutdown(ctx->fd, SHUT_RDWR);
+                close(ctx->fd);
+                return;
+            }
         } while (wb != hlen);
-
     }
 
     int wb = 0;
@@ -144,15 +161,26 @@ static void send_response(wurfld_connection_context *ctx) {
             fbuf_remove(ctx->output, wb);
         len = fbuf_used(ctx->output);
         wb =  write(ctx->fd, fbuf_data(ctx->output), len);
+        if (wb == -1) {
+            if (errno != EINTR || errno != EAGAIN) {
+                NOTICE("write on fd %d failed: %s", ctx->fd, strerror(errno));
+                return;
+            }
+        } else if (wb == 0) {
+            return;
+        }
     } while (wb != len);
 }
 
 void *worker(void *priv) {
     wurfld_connection_context *ctx = (wurfld_connection_context *)priv;
 
+    DEBUG1("Started worker %p on fd %d", pthread_self(), ctx->fd);
+
     char *useragent = NULL;
-    // we have a complete http request
     fbuf_trim(ctx->input);
+
+    // parse the request 
     char *request_data = fbuf_data(ctx->input);
     if (use_http && strncmp(request_data, "GET /lookup/", 12) == 0) {
         char *reqline_start = fbuf_data(ctx->input) + 12;
@@ -193,14 +221,23 @@ void *worker(void *priv) {
             len -= wb;
             ofx += wb;
             wb =  write(ctx->fd, response+ofx, len);
+            if (wb == -1) {
+                if (errno != EINTR || errno != EAGAIN) {
+                    NOTICE("write on fd %d failed: %s", ctx->fd, strerror(errno));
+                    break;
+                }
+            } else if (wb == 0) {
+                break;
+            }
         } while (wb != len);
     }
+    shutdown(ctx->fd, SHUT_RDWR);
     close(ctx->fd);
     fbuf_free(ctx->input);
     fbuf_free(ctx->output);
-    free(ctx->callbacks);
     free(ctx->useragent); 
     free(ctx);
+    DEBUG1("Ended worker %p on fd %d", pthread_self(), ctx->fd);
     return NULL;
 }
 
@@ -210,16 +247,24 @@ static void wurfld_input_handler(iomux_t *iomux, int fd, void *data, int len, vo
         return;
     DEBUG1("New data on fd %d", fd);
     fbuf_add_binary(ctx->input, data, len);
-    char *request_data = fbuf_data(ctx->input);
-    char *request_terminator = use_http ? strstr(request_data, "\r\n\r\n") : strstr(request_data, "\n");
-    if (!request_terminator && use_http) {
-        request_terminator = strstr(request_data, "\n\n");
+
+    if (fbuf_used(ctx->input) < 4)
+        return;
+
+    // check if we have a complete requset
+    char *current_data = fbuf_end(ctx->input) - (use_http ? 4 : 1);
+    char *request_terminator = use_http ? strstr(current_data, "\r\n\r\n") : strstr(current_data, "\n");
+    if (!request_terminator && use_http) { // support some broken clients/requests
+        request_terminator = strstr(current_data, "\n\n");
     }
     if (request_terminator) {
+        // we have a complete request so we can now start 
+        // background worker to handle it
         pthread_t worker_thread;
         ctx->fd = fd;
         pthread_create(&worker_thread, NULL, worker, ctx);
         pthread_detach(worker_thread);
+        // let the worker take care of the fd from now on
         iomux_remove(iomux, fd);
     }
 }
@@ -341,13 +386,15 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, wurfld_do_nothing);
 
     // initialize the callbacks descriptor
-    wurfld_callbacks.mux_connection = wurfld_connection_handler;
-    wurfld_callbacks.mux_input = wurfld_input_handler;
-    wurfld_callbacks.mux_eof = wurfld_eof_handler;
-    wurfld_callbacks.mux_output = NULL;
-    wurfld_callbacks.mux_timeout = NULL;
-    wurfld_callbacks.priv = NULL;
- 
+    iomux_callbacks_t wurfld_callbacks = {
+        .mux_connection = wurfld_connection_handler,
+        .mux_input = wurfld_input_handler,
+        .mux_eof = wurfld_eof_handler,
+        .mux_output = NULL,
+        .mux_timeout = NULL,
+        .priv = &wurfld_callbacks
+    };
+
     iomux = iomux_create();
 
     int listen_fd = open_socket(listen_address, listen_port);    

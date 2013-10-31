@@ -377,7 +377,7 @@ iomux_run(iomux_t *iomux, struct timeval *tv)
                         socklen_t socklen = sizeof(struct sockaddr);
                         // if it is, accept all pending connections and add them to the mux
                         while ((newfd = accept(fd, (struct sockaddr *)&peer, &socklen)) >= 0) {
-                            DEBUG("new connection to fd %d from %s", fd, inet_ntoa(peer.sin_addr));
+                            DEBUG2("new connection to fd %d from %s", fd, inet_ntoa(peer.sin_addr));
 			    cbs->mux_connection(iomux, newfd, cbs->priv);
                         }
                     } else {
