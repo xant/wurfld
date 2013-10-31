@@ -146,6 +146,7 @@ static void send_response(wurfld_connection_context *ctx) {
                     close(ctx->fd);
                     return;
                 }
+                wb = 0;
             } else if (wb == 0) {
                 shutdown(ctx->fd, SHUT_RDWR);
                 close(ctx->fd);
@@ -166,6 +167,7 @@ static void send_response(wurfld_connection_context *ctx) {
                 NOTICE("write on fd %d failed: %s", ctx->fd, strerror(errno));
                 return;
             }
+            wb = 0;
         } else if (wb == 0) {
             return;
         }
@@ -226,18 +228,19 @@ void *worker(void *priv) {
                     NOTICE("write on fd %d failed: %s", ctx->fd, strerror(errno));
                     break;
                 }
+                wb = 0;
             } else if (wb == 0) {
                 break;
             }
         } while (wb != len);
     }
+    DEBUG1("Ended worker %p on fd %d", pthread_self(), ctx->fd);
     shutdown(ctx->fd, SHUT_RDWR);
     close(ctx->fd);
     fbuf_free(ctx->input);
     fbuf_free(ctx->output);
     free(ctx->useragent); 
     free(ctx);
-    DEBUG1("Ended worker %p on fd %d", pthread_self(), ctx->fd);
     return NULL;
 }
 
