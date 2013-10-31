@@ -34,6 +34,7 @@ typedef struct {
 
 char *unescape_uri_request(char *uri) {
     static fbuf_t buf = FBUF_STATIC_INITIALIZER;
+    fbuf_clear(&buf);
     char *p = uri;
     while (*p != 0) {
         char *n = p;
@@ -163,7 +164,6 @@ static void wurfld_input_handler(iomux_t *iomux, int fd, void *data, int len, vo
 
                 wurfld_get_capabilities(useragent, ctx->output);
 
-                fbuf_clear(ctx->input);
                 int len = fbuf_used(ctx->output);
 
                 if (use_http) {
@@ -182,7 +182,6 @@ static void wurfld_input_handler(iomux_t *iomux, int fd, void *data, int len, vo
                     ctx->callbacks->mux_output = wurfld_output_handler;
             } else if (use_http) {
                 iomux_write(iomux, fd, "HTTP/1.1 400 NOT SUPPORTED\r\n\r\n", 30);
-                // TODO - return 400 NOT SUPPORTED
             }
             fbuf_clear(ctx->input);
         }
