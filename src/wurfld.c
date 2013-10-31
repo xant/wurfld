@@ -125,7 +125,7 @@ static void wurfld_input_handler(iomux_t *iomux, int fd, void *data, int len, vo
     wurfld_connection_context *ctx = (wurfld_connection_context *)priv;
     if (ctx) {
         fbuf_add_binary(ctx->input, data, len);
-        DEBUG1("New data from %d : %s", fd, fbuf_data(ctx->input));
+        DEBUG1("New data on fd %d", fd);
         char *end = fbuf_end(ctx->input);
         if ((use_http && fbuf_used(ctx->input) > 4 && (strncmp(end-4, "\r\n\r\n", 4) == 0 || strncmp(end-2, "\n\n", 2) == 0)) ||
             (!use_http && fbuf_used(ctx->input) && *(end-1) == '\n'))
@@ -154,14 +154,9 @@ static void wurfld_input_handler(iomux_t *iomux, int fd, void *data, int len, vo
             } else if (!use_http) {
                 useragent = fbuf_data(ctx->input);
             }
-            if (useragent) {
-                if (strlen(useragent) < WURFL_USERAGENT_SIZE_THRESHOLD) {
-                    // empty request
-                    iomux_write(iomux, fd, "{ }\n", 4);
-                    fbuf_clear(ctx->input);
-                    return;
-                }
 
+            if (useragent) {
+                DEBUG1("Looking up useragent : %s", useragent);
                 wurfld_get_capabilities(useragent, ctx->output);
 
                 int len = fbuf_used(ctx->output);
@@ -181,7 +176,9 @@ static void wurfld_input_handler(iomux_t *iomux, int fd, void *data, int len, vo
                 if (wb != len) 
                     ctx->callbacks->mux_output = wurfld_output_handler;
             } else if (use_http) {
-                iomux_write(iomux, fd, "HTTP/1.1 400 NOT SUPPORTED\r\n\r\n", 30);
+                char response[2048];
+                snprintf(response, sizeof(response), "%s 400 NOT SUPPORTED\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\nNOT SUPPORTED", is_http10 ? "HTTP/1.0" : "HTTP/1.1");
+                iomux_write(iomux, fd, response, strlen(response));
             }
             fbuf_clear(ctx->input);
         }
