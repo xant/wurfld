@@ -61,8 +61,8 @@ static void wurfld_get_capabilities(char *useragent, fbuf_t *output) {
     wurfl_device_handle device = wurfl_lookup_useragent(wurfl, useragent); 
     if (device) {
         int count = 0;
-        fbuf_printf(output, "{\"match\":\"%s\",\"device\":\"%s\",\"capabilities\":{",
-                wurfl_device_get_matcher_name(device), wurfl_device_get_id(device) );
+        fbuf_printf(output, "{\"match_type\":\"%d\",\"matcher_name\":\"%s\",\"device\":\"%s\",\"capabilities\":{",
+                wurfl_device_get_match_type(device), wurfl_device_get_matcher_name(device), wurfl_device_get_id(device) );
         wurfl_device_capability_enumerator_handle enumerator = wurfl_device_get_capability_enumerator(device);
         while(wurfl_device_capability_enumerator_is_valid(enumerator)) {
             char *name = (char *)wurfl_device_capability_enumerator_get_name(enumerator);
@@ -119,7 +119,8 @@ static void wurfld_output_handler(iomux_t *iomux, int fd, void *priv) {
 
         if (wb == len) {
             ctx->callbacks->mux_output = NULL;
-            iomux_close(iomux, fd);
+            if (ctx->is_http10)
+                iomux_close(iomux, fd);
         }
     }
 }
