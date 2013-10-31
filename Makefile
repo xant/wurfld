@@ -1,6 +1,6 @@
 UNAME := $(shell uname)
 
-LDFLAGS += -L. -lwurfl
+LDFLAGS += -L. -pthread -lwurfl
 
 ifeq ($(UNAME), Linux)
 LDFLAGS +=
