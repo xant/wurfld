@@ -23,7 +23,7 @@
 static wurfl_handle wurfl = NULL;
 static iomux_t *iomux = NULL;
 static char *wurfl_file = WURFL_DBFILE_DEFAULT;
-
+static int use_http = 1;
 static iomux_callbacks_t wurfld_callbacks;
 
 typedef struct {
@@ -31,6 +31,29 @@ typedef struct {
     fbuf_t *output;
     iomux_callbacks_t *callbacks;
 } wurfld_connection_context;
+
+char *unescape_uri_request(char *uri) {
+    static fbuf_t buf = FBUF_STATIC_INITIALIZER;
+    char *p = uri;
+    while (*p != 0) {
+        char *n = p;
+        while (*n != '%' && *n != 0)
+            n++;
+        fbuf_add_binary(&buf, p, n-p);
+        p = n;
+        if (*n != 0) {
+            // p and n now both point to %
+            p+=3;
+            n++;
+            int c;
+            if (sscanf(n, "%02x", &c) == 1)
+                fbuf_add_binary(&buf, (char *)&c, 1);
+            else
+                WARN("Can't unescape uri byte");
+        }
+    }
+    return fbuf_data(&buf);
+}
 
 static void wurfld_get_capabilities(char *useragent, fbuf_t *output) {
     wurfl_device_handle device = wurfl_lookup_useragent(wurfl, useragent); 
@@ -103,28 +126,64 @@ static void wurfld_input_handler(iomux_t *iomux, int fd, void *data, int len, vo
         fbuf_add_binary(ctx->input, data, len);
         DEBUG1("New data from %d : %s", fd, fbuf_data(ctx->input));
         char *end = fbuf_end(ctx->input);
-        if (fbuf_used(ctx->input) && *(end-1) == '\n') {
+        if ((use_http && fbuf_used(ctx->input) > 4 && (strncmp(end-4, "\r\n\r\n", 4) == 0 || strncmp(end-2, "\n\n", 2) == 0)) ||
+            (!use_http && fbuf_used(ctx->input) && *(end-1) == '\n'))
+        {
+            int is_http10 = 0;
+            char *useragent = NULL;
+            // we have a complete http request
             fbuf_trim(ctx->input);
-            char *useragent = fbuf_data(ctx->input);
-            if (strlen(useragent) < WURFL_USERAGENT_SIZE_THRESHOLD) {
-                // empty request
-                iomux_write(iomux, fd, "{ }\n", 4);
-                fbuf_clear(ctx->input);
-                return;
+            if (use_http && strncmp(fbuf_data(ctx->input), "GET /lookup/", 12) == 0) {
+                char *reqline_start = fbuf_data(ctx->input) + 12;
+                char *reqline_end = reqline_start;
+
+                while (*reqline_end != '\r' && *reqline_end != '\n')
+                    reqline_end++;
+
+                char reqline[reqline_end-reqline_start];
+                snprintf(reqline, reqline_end-reqline_start, "%s", reqline_start);
+
+                char *httpv = strstr(reqline, " HTTP/1");
+                if (httpv) {
+                    *httpv = 0;
+                    httpv++;
+                    is_http10 = (strncmp(httpv, "HTTP/1.0", 8) == 0);
+                }
+                useragent = unescape_uri_request(reqline);
+            } else if (!use_http) {
+                useragent = fbuf_data(ctx->input);
             }
+            if (useragent) {
+                if (strlen(useragent) < WURFL_USERAGENT_SIZE_THRESHOLD) {
+                    // empty request
+                    iomux_write(iomux, fd, "{ }\n", 4);
+                    fbuf_clear(ctx->input);
+                    return;
+                }
 
-            wurfld_get_capabilities(useragent, ctx->output);
+                wurfld_get_capabilities(useragent, ctx->output);
 
-            fbuf_clear(ctx->input);
+                fbuf_clear(ctx->input);
+                int len = fbuf_used(ctx->output);
 
-            int len = fbuf_used(ctx->output);
-            int wb = iomux_write(iomux, fd, fbuf_data(ctx->output), len);
-            if (wb)
-                fbuf_remove(ctx->output, wb);
-            // check if we still need to write stuff (because we might have filled in the output buffer
-            // and in case register an output handler to take care of that
-            if (wb != len) 
-                ctx->callbacks->mux_output = wurfld_output_handler;
+                if (use_http) {
+                    char response_header[1024];
+                    sprintf(response_header, "%s 200 OK\r\nContent-Type: application/json\r\nContent-length: %d\r\n\r\n",
+                            is_http10 ? "HTTP/1.0" : "HTTP/1.1", fbuf_used(ctx->output));
+                    iomux_write(iomux, fd, response_header, strlen(response_header));
+                }
+
+                int wb = iomux_write(iomux, fd, fbuf_data(ctx->output), len);
+                if (wb)
+                    fbuf_remove(ctx->output, wb);
+                // check if we still need to write stuff (because we might have filled in the output buffer
+                // and in case register an output handler to take care of that
+                if (wb != len) 
+                    ctx->callbacks->mux_output = wurfld_output_handler;
+            } else if (use_http) {
+                iomux_write(iomux, fd, "HTTP/1.1 400 NOT SUPPORTED\r\n\r\n", 30);
+                // TODO - return 400 NOT SUPPORTED
+            }
             fbuf_clear(ctx->input);
         }
     }
@@ -172,7 +231,9 @@ static void usage(char *progname, char *msg) {
            "    -d <level>            debug level\n"
            "    -l <ip_address>       ip address where to listen for incoming connections\n"
            "    -p <port>             tcp port where to listen for incoming connections\n"
-           "    -w <wurfl_file>       path to the wurfl xml file\n", progname);
+           "    -w <wurfl_file>       path to the wurfl xml file\n"
+           "    -n                    no http, expects a raw useragent string on the connected\n"
+           "                          socket, terminated by a newline\n", progname);
     exit(-2);
 }
 
@@ -217,12 +278,13 @@ int main(int argc, char **argv) {
         {"listen", 2, 0, 'l'},
         {"port", 2, 0, 'p'},
         {"wurfl_file", 1, 0, 'w'},
+        {"nohttp", 0, 0, 'n'},
         {"help", 0, 0, 'h'},
         {0, 0, 0, 0}
     };
 
     char c;
-    while ((c = getopt_long (argc, argv, "d:fhl:p:w:?", long_options, &option_index))) {
+    while ((c = getopt_long (argc, argv, "d:fhl:np:w:?", long_options, &option_index))) {
         if (c == -1) {
             break;
         }
@@ -241,6 +303,9 @@ int main(int argc, char **argv) {
                 break;
             case 'w':
                 wurfl_file = optarg;
+                break;
+            case 'n':
+                use_http = 0;
                 break;
             case 'h':
             case '?':
