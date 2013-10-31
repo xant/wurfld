@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <signal.h>
 #include <errno.h>
@@ -9,6 +10,8 @@
 #include <connections.h>
 #include <log.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <pthread.h>
 
 #include <wurfl/wurfl.h>
@@ -39,13 +42,13 @@ typedef struct {
 } wurfld_connection_context;
 
 static char *unescape_uri_request(char *uri) {
-    fbuf_t *buf = fbuf_create(0);
+    fbuf_t buf = FBUF_STATIC_INITIALIZER;
     char *p = uri;
     while (*p != 0) {
         char *n = p;
         while (*n != '%' && *n != 0)
             n++;
-        fbuf_add_binary(buf, p, n-p);
+        fbuf_add_binary(&buf, p, n-p);
         p = n;
         if (*n != 0) {
             // p and n now both point to %
@@ -53,13 +56,12 @@ static char *unescape_uri_request(char *uri) {
             n++;
             int c;
             if (sscanf(n, "%02x", &c) == 1)
-                fbuf_add_binary(buf, (char *)&c, 1);
+                fbuf_add_binary(&buf, (char *)&c, 1);
             else
                 WARN("Can't unescape uri byte");
         }
     }
-    char *data = fbuf_data(buf);
-    free(buf);
+    char *data = fbuf_data(&buf);
     return data;
 }
 
@@ -118,7 +120,7 @@ static void wurfld_connection_handler(iomux_t *iomux, int fd, void *priv) {
 
 static void send_response(wurfld_connection_context *ctx) {
     char *useragent = ctx->useragent;
-    DEBUG1("Looking up useragent : %s", useragent);
+    DEBUG1("Worker %p is looking up useragent : %s", pthread_self(), useragent);
 
     // this might be unnecessary if libwurfl is thread-safe
     // XXX - needs to be checked
@@ -134,63 +136,45 @@ static void send_response(wurfld_connection_context *ctx) {
                 "Server: wurfld\r\n"
                 "Connection: Close\r\n\r\n",
                 ctx->is_http10 ? "HTTP/1.0" : "HTTP/1.1", fbuf_used(ctx->output));
-        int wb = 0;
-        int ofx = 0;
-        int hlen = strlen(response_header);
-        do {
-            hlen -= wb;
-            ofx += wb;
-            wb = write(ctx->fd, response_header + wb, hlen);
-            if (wb == -1) {
-                if (errno != EINTR || errno != EAGAIN) {
-                    NOTICE("write on fd %d failed: %s", ctx->fd, strerror(errno));
-                    shutdown(ctx->fd, SHUT_RDWR);
-                    close(ctx->fd);
-                    return;
-                }
-                wb = 0;
-            } else if (wb == 0) {
-                shutdown(ctx->fd, SHUT_RDWR);
-                close(ctx->fd);
-                return;
-            }
-        } while (wb != hlen);
+
+        int err = write_socket(ctx->fd, response_header, strlen(response_header));
+        if (err != 0) {
+            ERROR("(%p) Can't write the response header : %s", pthread_self(), strerror(errno));
+        }
     }
 
-    int wb = 0;
-    int len;
-    do {
-        if (wb)
-            fbuf_remove(ctx->output, wb);
-        len = fbuf_used(ctx->output);
-        wb =  write(ctx->fd, fbuf_data(ctx->output), len);
-        if (wb == -1) {
-            if (errno != EINTR || errno != EAGAIN) {
-                NOTICE("write on fd %d failed: %s", ctx->fd, strerror(errno));
-                return;
-            }
-            wb = 0;
-        } else if (wb == 0) {
-            return;
-        }
-    } while (wb != len);
+    if (write_socket(ctx->fd, fbuf_data(ctx->output), fbuf_used(ctx->output)) != 0) {
+        ERROR("(%p) Can't write the response data : %s", pthread_self(), strerror(errno));
+    }
 }
 
 void *worker(void *priv) {
     wurfld_connection_context *ctx = (wurfld_connection_context *)priv;
 
-    DEBUG1("Started worker %p on fd %d", pthread_self(), ctx->fd);
+    DEBUG1("Worker %p started on fd %d", pthread_self(), ctx->fd);
 
     // we don't need to receive anything anymore on this fd
     int err = shutdown(ctx->fd, SHUT_RD);
     if (err != 0)
         NOTICE("Can't shutdown the receive part of fd %d : %s", ctx->fd, strerror(errno));
 
+    int opts = fcntl(ctx->fd, F_GETFL);
+    if (opts >= 0) {
+        err = fcntl(ctx->fd, F_SETFL, opts & (~O_NONBLOCK));
+        if (err != 0)
+            NOTICE("Can't set blocking mode on fd %d : %s", ctx->fd, strerror(errno));
+    } else {
+        ERROR("Can't get flags on fd %d : %s", ctx->fd, strerror(errno));
+    }
+
     char *useragent = NULL;
     fbuf_trim(ctx->input);
 
     // parse the request 
     char *request_data = fbuf_data(ctx->input);
+    struct sockaddr_in peer;
+    socklen_t socklen = sizeof(struct sockaddr);
+    getpeername(ctx->fd, (struct sockaddr *)&peer, &socklen);
     if (use_http && strncmp(request_data, "GET /lookup/", 12) == 0) {
         char *reqline_start = fbuf_data(ctx->input) + 12;
         char *reqline_end = reqline_start;
@@ -214,34 +198,25 @@ void *worker(void *priv) {
     }
 
     if (useragent) {
+        NOTICE("(%p) Lookup request from %s: %s", pthread_self(), inet_ntoa(peer.sin_addr), useragent);
         ctx->useragent = useragent;
         send_response(ctx);
     } else if (use_http) {
+        NOTICE("(%p) Unsupported Request from %s: %s", pthread_self(), inet_ntoa(peer.sin_addr), request_data);
         char response[2048];
+
         snprintf(response, sizeof(response),
-                 "%s 400 NOT SUPPORTED\r\nContent-Type: text/plain\r\nContent-Length: 17\r\n\r\n400 NOT SUPPORTED",
+                 "%s 400 NOT SUPPORTED\r\n"
+                 "Content-Type: text/plain\r\n"
+                 "Content-Length: 17\r\n\r\n"
+                 "400 NOT SUPPORTED",
                  ctx->is_http10 ? "HTTP/1.0" : "HTTP/1.1");
 
-
-        int wb = 0;
-        int len = strlen(response);
-        int ofx = 0;
-        do {
-            len -= wb;
-            ofx += wb;
-            wb =  write(ctx->fd, response+ofx, len);
-            if (wb == -1) {
-                if (errno != EINTR || errno != EAGAIN) {
-                    NOTICE("write on fd %d failed: %s", ctx->fd, strerror(errno));
-                    break;
-                }
-                wb = 0;
-            } else if (wb == 0) {
-                break;
-            }
-        } while (wb != len);
+        if (write_socket(ctx->fd, response, strlen(response)) != 0) {
+            ERROR("Worker %p failed writing reponse: %s", pthread_self(), strerror(errno));
+        }
     }
-    DEBUG1("Ended worker %p on fd %d", pthread_self(), ctx->fd);
+    DEBUG1("Worker %p finished on fd %d", pthread_self(), ctx->fd);
     shutdown(ctx->fd, SHUT_RDWR);
     close(ctx->fd);
     fbuf_free(ctx->input);
@@ -302,6 +277,7 @@ static void usage(char *progname, char *msg) {
 
 static void wurfl_init() {
     NOTICE("Initializing WURFL");
+    pthread_mutex_lock(&wurfl_lock);
     wurfl = wurfl_create(); 
     wurfl_set_engine_target(wurfl, WURFL_ENGINE_TARGET_HIGH_PERFORMANCE);
     wurfl_set_cache_provider(wurfl, WURFL_CACHE_PROVIDER_DOUBLE_LRU, "10000,3000");
@@ -311,6 +287,7 @@ static void wurfl_init() {
         WARN("Can't initialize wurfl %s", wurfl_get_error_message(wurfl));
         exit(-1);
     }
+    pthread_mutex_unlock(&wurfl_lock);
     NOTICE("DONE");
 }
 

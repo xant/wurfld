@@ -135,6 +135,64 @@ open_socket(const char *host, int port)
 }
 
 /*!
+ * \brief Writes to a socket
+ * \param fd socket
+ * \param buf buffer to write
+ * \param len size of the buffer
+ * \returns 0 on success, -1 on error (errno is se to the underlying error)
+ */
+int write_socket(int fd, char *buf, int len) {
+    int wb = 0;
+    int ofx = 0;
+    do {
+        len -= wb;
+        ofx += wb;
+        wb =  write(fd, buf+ofx, len);
+        if (wb == -1) {
+            if (errno != EINTR || errno != EAGAIN) {
+                NOTICE("write on fd %d failed: %s", fd, strerror(errno));
+                return -1;
+            }
+            wb = 0;
+        } else if (wb == 0) {
+            break;
+        }
+    } while (wb != len);
+    return 0;
+}
+
+/*!
+ * \brief Read from a socket
+ * \param fd socket
+ * \param buf buffer where to store the read data
+ * \param len pointer to an integer indicating the size of the buffer in input
+ *            and the actual size written on output
+ * \returns 0 on success, -1 on error (errno is se to the underlying error)
+ */
+int read_socket(int fd, char *buf, int *len) {
+    int rb = 0;
+    int ofx = 0;
+    int to_read = *len;
+    do {
+        to_read -= rb;
+        rb =  read(fd, buf+ofx, to_read);
+        if (rb == -1) {
+            if (errno != EINTR || errno != EAGAIN) {
+                NOTICE("Read on fd %d failed: %s", fd, strerror(errno));
+                return -1;
+            }
+            rb = 0;
+        } else if (rb == 0) {
+            break;
+        }
+        ofx += rb;
+    } while (rb != to_read);
+    *len = ofx;
+    return 0;
+}
+
+
+/*!
  * \brief Open a TCP connection to a client.
  * \param host hostname
  * \param port port number

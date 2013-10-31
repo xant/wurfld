@@ -10,6 +10,9 @@ int open_connection(const char *host, int port, unsigned int timeout);
 int open_lsocket(const char *filename);
 int open_fifo(const char *filename);
 
+int write_socket(int fd, char *buf, int len);
+int read_socket(int fd, char *buf, int *len);
+
 #ifdef __cplusplus
 }
 #endif
