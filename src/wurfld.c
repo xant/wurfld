@@ -181,6 +181,11 @@ void *worker(void *priv) {
 
     DEBUG1("Started worker %p on fd %d", pthread_self(), ctx->fd);
 
+    // we don't need to receive anything anymore on this fd
+    int err = shutdown(ctx->fd, SHUT_RD);
+    if (err != 0)
+        NOTICE("Can't shutdown the receive part of fd %d : %s", ctx->fd, strerror(errno));
+
     char *useragent = NULL;
     fbuf_trim(ctx->input);
 
