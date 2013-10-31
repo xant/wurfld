@@ -32,10 +32,10 @@ pthread_mutex_t wurfld_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct {
     fbuf_t *input;
     fbuf_t *output;
-    iomux_callbacks_t callbacks;
-    int is_http10;
     char *useragent;
     int fd;
+    int is_http10;
+    iomux_callbacks_t callbacks;
 } wurfld_connection_context;
 
 static char *unescape_uri_request(char *uri) {
@@ -120,7 +120,9 @@ static void send_response(wurfld_connection_context *ctx) {
     char *useragent = ctx->useragent;
     DEBUG1("Looking up useragent : %s", useragent);
 
-    pthread_mutex_lock(&wurfld_lock);
+    // this might be unnecessary if libwurfl is thread-safe
+    // XXX - needs to be checked
+    pthread_mutex_lock(&wurfld_lock); 
     wurfld_get_capabilities(useragent, ctx->output);
     pthread_mutex_unlock(&wurfld_lock);
 
