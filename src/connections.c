@@ -171,23 +171,13 @@ int write_socket(int fd, char *buf, int len) {
  */
 int read_socket(int fd, char *buf, int *len) {
     int rb = 0;
-    int ofx = 0;
     int to_read = *len;
-    do {
-        to_read -= rb;
-        rb =  read(fd, buf+ofx, to_read);
-        if (rb == -1) {
-            if (errno != EINTR || errno != EAGAIN) {
-                NOTICE("Read on fd %d failed: %s", fd, strerror(errno));
-                return -1;
-            }
-            rb = 0;
-        } else if (rb == 0) {
-            break;
-        }
-        ofx += rb;
-    } while (rb != to_read);
-    *len = ofx;
+    rb =  read(fd, buf, to_read);
+    if (rb == -1 && (errno != EINTR || errno != EAGAIN)) { 
+        NOTICE("Read on fd %d failed: %s", fd, strerror(errno));
+        return -1;
+    }
+    *len = rb;
     return 0;
 }
 
@@ -262,7 +252,7 @@ open_lsocket(const char *filename)
     strncpy(sockaddr.sun_path, filename, sizeof(sockaddr.sun_path));
 
     if (bind(sock, (struct sockaddr *)&sockaddr, sizeof(sockaddr)) == -1
-	|| listen(sock, 5) == -1) {
+	|| listen(sock, -1) == -1) {
 	shutdown(sock, SHUT_RDWR);
 	close(sock);
 	return -1;

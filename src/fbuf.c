@@ -58,12 +58,12 @@
 #define DEBUG_FBUF_INFO(fbuf, msg)	/* nop */ //!< Debug printf
 #endif
 
-#define FBUF_MINSIZE		16		//!< Minimum size of buffer
+#define FBUF_MINSIZE		8192		//!< Minimum size of buffer
 #define FBUF_FASTGROWSIZE	64*1024		//!< Grow quickly up to 64kB (x 2) ...
 #define FBUF_SLOWGROWSIZE	64*1024		//!< ... and slowly after that (+64kB)
 #define FBUF_LINE_EST		127		//!< estimated for the length of a printf statement
-#define FBUF_READ_EST		1024		//!< default value for FBufRead()
-#define FBUF_WRITE_EST		10240		//!< default value for FBufWrite()
+#define FBUF_READ_EST		1024		//!< default value for fbuf_read()
+#define FBUF_WRITE_EST		10240		//!< default value for fbuf_write()
 
 static int fbuf_count = 0;
 static unsigned int globalMaxLen = 0;		//!< hard limit for size of all buffers
