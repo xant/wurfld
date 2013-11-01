@@ -25,12 +25,13 @@
 #define WURFL_LOGLEVEL_DEFAULT 0
 #define WURFL_USERAGENT_SIZE_THRESHOLD 16
 
+#define ATOMIC_READ(__p) __sync_fetch_and_add(&__p, 0)
+#define ATOMIC_CMPXCHG(__p, __v1, __v2) __sync_bool_compare_and_swap(&__p, __v1, __v2)
+
 static wurfl_handle wurfl = NULL;
 static iomux_t *iomux = NULL;
 static char *wurfl_file = WURFL_DBFILE_DEFAULT;
 static int use_http = 1;
-
-pthread_mutex_t wurfld_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
     fbuf_t *input;
@@ -66,7 +67,7 @@ static char *unescape_uri_request(char *uri) {
 }
 
 static void wurfld_get_capabilities(char *useragent, fbuf_t *output) {
-    wurfl_device_handle device = wurfl_lookup_useragent(wurfl, useragent); 
+    wurfl_device_handle device = wurfl_lookup_useragent(ATOMIC_READ(wurfl), useragent); 
     if (device) {
         int count = 0;
         fbuf_printf(output, "{\"match_type\":\"%d\",\"matcher_name\":\"%s\",\"device\":\"%s\",\"capabilities\":{",
@@ -124,9 +125,7 @@ static void send_response(wurfld_connection_context *ctx) {
 
     // this might be unnecessary if libwurfl is thread-safe
     // XXX - needs to be checked
-    pthread_mutex_lock(&wurfld_lock); 
     wurfld_get_capabilities(useragent, ctx->output);
-    pthread_mutex_unlock(&wurfld_lock);
 
     if (use_http) {
         char response_header[1024];
@@ -277,26 +276,26 @@ static void usage(char *progname, char *msg) {
 
 static void wurfl_init() {
     NOTICE("Initializing WURFL");
-    pthread_mutex_lock(&wurfl_lock);
-    wurfl = wurfl_create(); 
-    wurfl_set_engine_target(wurfl, WURFL_ENGINE_TARGET_HIGH_PERFORMANCE);
-    wurfl_set_cache_provider(wurfl, WURFL_CACHE_PROVIDER_DOUBLE_LRU, "10000,3000");
-    wurfl_set_root(wurfl, wurfl_file);
-    wurfl_error err = wurfl_load(wurfl);
+    wurfl_handle new_wurfl = wurfl_create(); 
+    wurfl_set_engine_target(new_wurfl, WURFL_ENGINE_TARGET_HIGH_PERFORMANCE);
+    wurfl_set_cache_provider(new_wurfl, WURFL_CACHE_PROVIDER_DOUBLE_LRU, "10000,3000");
+    wurfl_set_root(new_wurfl, wurfl_file);
+    wurfl_error err = wurfl_load(new_wurfl);
     if (err != WURFL_OK) {
-        WARN("Can't initialize wurfl %s", wurfl_get_error_message(wurfl));
+        WARN("Can't initialize wurfl %s", wurfl_get_error_message(new_wurfl));
         exit(-1);
     }
-    pthread_mutex_unlock(&wurfl_lock);
+    wurfl_handle old_wurfl;
+    do {
+        old_wurfl = ATOMIC_READ(wurfl);
+    } while (!ATOMIC_CMPXCHG(wurfl, old_wurfl, new_wurfl));
+    if (old_wurfl)
+        wurfl_destroy(old_wurfl);
     NOTICE("DONE");
 }
 
 static void wurfld_reload(int sig) {
     NOTICE("reloading database");
-    if (wurfl) {
-        wurfl_destroy(wurfl);
-        wurfl = NULL;
-    }
     wurfl_init();
 }
 
@@ -401,7 +400,7 @@ int main(int argc, char **argv) {
     // if we are here, iomux has exited the loop
     NOTICE("exiting");
     iomux_destroy(iomux);
-    wurfl_destroy(wurfl);
+    wurfl_destroy(ATOMIC_READ(wurfl));
     close(listen_fd);
     
     exit(0);
