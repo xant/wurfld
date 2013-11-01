@@ -32,6 +32,7 @@ static wurfl_handle wurfl = NULL;
 static iomux_t *iomux = NULL;
 static char *wurfl_file = WURFL_DBFILE_DEFAULT;
 static int use_http = 1;
+static int single_thread = 0;
 
 typedef struct {
     fbuf_t *input;
@@ -246,10 +247,14 @@ static void wurfld_input_handler(iomux_t *iomux, int fd, void *data, int len, vo
         // background worker to handle it
         pthread_t worker_thread;
         ctx->fd = fd;
-        pthread_create(&worker_thread, NULL, worker, ctx);
-        pthread_detach(worker_thread);
         // let the worker take care of the fd from now on
         iomux_remove(iomux, fd);
+        if (single_thread) {
+            worker(ctx);
+        } else {
+            pthread_create(&worker_thread, NULL, worker, ctx);
+            pthread_detach(worker_thread);
+        }
     }
 }
 
@@ -269,6 +274,7 @@ static void usage(char *progname, char *msg) {
            "    -l <ip_address>       ip address where to listen for incoming connections\n"
            "    -p <port>             tcp port where to listen for incoming connections\n"
            "    -w <wurfl_file>       path to the wurfl xml file\n"
+           "    -s                    no multithreading, handle all requests in the main thread\n"
            "    -n                    no http, expects a raw useragent string on the connected\n"
            "                          socket, terminated by a newline\n", progname);
     exit(-2);
@@ -322,12 +328,13 @@ int main(int argc, char **argv) {
         {"port", 2, 0, 'p'},
         {"wurfl_file", 1, 0, 'w'},
         {"nohttp", 0, 0, 'n'},
+        {"singlethread", 0, 0, 's'},
         {"help", 0, 0, 'h'},
         {0, 0, 0, 0}
     };
 
     char c;
-    while ((c = getopt_long (argc, argv, "d:fhl:np:w:?", long_options, &option_index))) {
+    while ((c = getopt_long (argc, argv, "d:fhl:np:sw:?", long_options, &option_index))) {
         if (c == -1) {
             break;
         }
@@ -343,6 +350,9 @@ int main(int argc, char **argv) {
                 break;
             case 'p':
                 listen_port = atoi(optarg);
+                break;
+            case 's':
+                single_thread = 1;
                 break;
             case 'w':
                 wurfl_file = optarg;
