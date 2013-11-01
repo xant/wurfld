@@ -67,40 +67,53 @@ static char *unescape_uri_request(char *uri) {
     return data;
 }
 
+static void wurfld_fill_capabilities(wurfl_device_capability_enumerator_handle enumerator, char *label, fbuf_t *output) {
+    int count = 0;
+    fbuf_printf(output, "\"%s\":{", label);
+    while(wurfl_device_capability_enumerator_is_valid(enumerator)) {
+        char *name = (char *)wurfl_device_capability_enumerator_get_name(enumerator);
+        char *val = (char *)wurfl_device_capability_enumerator_get_value(enumerator);
+        if (name && val) {
+            fbuf_printf(output, "%s\"%s\":" , count ? "," : "", name);
+            if (strcmp(val, "true") == 0) {
+                fbuf_add(output, "1");
+            } else if (strcmp(val, "false") == 0) {
+                fbuf_add(output, "0");
+            } else {
+                char *escaped_val = NULL;
+                unsigned long escaped_len = 0;
+                byte_escape('\"', '\\', val, strlen(val)+1, &escaped_val, &escaped_len);
+                if (escaped_val) {
+                    fbuf_printf(output, "\"%s\"", escaped_val);
+                    free(escaped_val);
+                } else {
+                    fbuf_add(output, "\"\"");
+                }
+            }
+            count++;
+        }
+        wurfl_device_capability_enumerator_move_next(enumerator);
+    }
+    fbuf_add(output, "}");
+    DEBUG2("found %d %s", count, label);
+}
+
 static void wurfld_get_capabilities(char *useragent, fbuf_t *output) {
     wurfl_device_handle device = wurfl_lookup_useragent(ATOMIC_READ(wurfl), useragent); 
     if (device) {
-        int count = 0;
-        fbuf_printf(output, "{\"match_type\":\"%d\",\"matcher_name\":\"%s\",\"device\":\"%s\",\"capabilities\":{",
+        fbuf_printf(output, "{\"match_type\":\"%d\",\"matcher_name\":\"%s\",\"device\":\"%s\",",
                 wurfl_device_get_match_type(device), wurfl_device_get_matcher_name(device), wurfl_device_get_id(device) );
+
         wurfl_device_capability_enumerator_handle enumerator = wurfl_device_get_capability_enumerator(device);
-        while(wurfl_device_capability_enumerator_is_valid(enumerator)) {
-            char *name = (char *)wurfl_device_capability_enumerator_get_name(enumerator);
-            char *val = (char *)wurfl_device_capability_enumerator_get_value(enumerator);
-            if (name && val) {
-                fbuf_printf(output, "%s\"%s\":" , count ? "," : "", name);
-                if (strcmp(val, "true") == 0) {
-                    fbuf_add(output, "1");
-                } else if (strcmp(val, "false") == 0) {
-                    fbuf_add(output, "0");
-                } else {
-                    char *escaped_val = NULL;
-                    unsigned long escaped_len = 0;
-                    byte_escape('\"', '\\', val, strlen(val)+1, &escaped_val, &escaped_len);
-                    if (escaped_val) {
-                        fbuf_printf(output, "\"%s\"", escaped_val);
-                        free(escaped_val);
-                    } else {
-                        fbuf_add(output, "\"\"");
-                    }
-                }
-                count++;
-            }
-            wurfl_device_capability_enumerator_move_next(enumerator);
-        }
-        fbuf_add(output, "}}\n");
+        wurfld_fill_capabilities(enumerator, "capabilities", output);
+        wurfl_device_capability_enumerator_destroy(enumerator);
+        fbuf_add(output, ",");
+        enumerator = wurfl_device_get_virtual_capability_enumerator(device);
+        wurfld_fill_capabilities(enumerator, "virtual_capabilities", output);
+        wurfl_device_capability_enumerator_destroy(enumerator);
+
+        fbuf_add(output, "}\n");
         wurfl_device_destroy(device);
-        DEBUG2("returned %d capabilities", count);
     }
 }
 
